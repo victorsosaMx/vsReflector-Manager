@@ -1,0 +1,9 @@
+[project]
+name = "vs-reflector-manager"
+version = "1.0.0"
+description = "Visual mirror manager for Arch Linux built with GTK4 and libadwaita."
+readme = "README.md"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 100
