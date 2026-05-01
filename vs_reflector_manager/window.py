@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import os
+import re
 import shlex
+import shutil
 import subprocess
 import threading
+import time as _time
+from urllib.parse import urlparse
 
 import gi
 
@@ -15,6 +19,8 @@ from gi.repository import Adw, GLib, Gtk
 from typing import TYPE_CHECKING
 
 from vs_reflector_manager.data import MirrorInfo, TestJob
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[mABCDEFGHJKSTfsu]|\x1b\(B|\x1b=|\x1b>")
 
 if TYPE_CHECKING:
     from vs_reflector_manager.chaotic_services import ChaoticMirror
@@ -37,10 +43,19 @@ from vs_reflector_manager.services import (
     MirrorSource,
     RestoreResult,
     apply_mirrorlist,
+    apply_pacnew,
     build_test_jobs,
+    check_updates,
+    delete_pacnew,
+    fetch_arch_news,
+    find_pacnew_files,
     generate_mirrorlist,
+    get_orphan_packages,
     list_backups,
     load_mirrors,
+    parse_current_mirrorlist,
+    parse_pacman_log,
+    remove_orphans,
     restore_mirrorlist,
     run_probe,
 )
@@ -269,11 +284,52 @@ class MainWindow(Adw.ApplicationWindow):
         self._refresh_views()
         self.connect("close-request", self._on_close_request)
         GLib.idle_add(self._reload_mirrors, None)
+        threading.Thread(target=self._bg_check_updates, daemon=True).start()
+        threading.Thread(target=self._bg_fetch_news, daemon=True).start()
 
     def _show_toast(self, message: str, timeout: int = 3) -> None:
         toast = Adw.Toast.new(message)
         toast.set_timeout(timeout)
         self._toast_overlay.add_toast(toast)
+
+    # ── Background tasks ──────────────────────────────────────────────────────
+
+    def _bg_check_updates(self) -> None:
+        count = check_updates()
+        GLib.idle_add(self._set_update_badge, count)
+
+    def _set_update_badge(self, count: int) -> bool:
+        if count > 0:
+            self._update_badge.set_text(str(count))
+            self._update_badge.set_visible(True)
+        else:
+            self._update_badge.set_visible(False)
+        return False
+
+    def _bg_fetch_news(self) -> None:
+        articles = fetch_arch_news()
+        GLib.idle_add(self._set_news, articles)
+
+    def _set_news(self, articles: list[dict]) -> bool:
+        if not articles or not hasattr(self, "_news_inner"):
+            return False
+        child = self._news_inner.get_first_child()
+        while child:
+            nxt = child.get_next_sibling()
+            self._news_inner.remove(child)
+            child = nxt
+        grp = Adw.PreferencesGroup(
+            title="Arch Linux News",
+            description="Review before running system updates",
+        )
+        for art in articles:
+            row = Adw.ActionRow(title=art["title"])
+            if art.get("pubdate"):
+                row.set_subtitle(art["pubdate"])
+            grp.add(row)
+        self._news_inner.append(grp)
+        self._news_revealer.set_reveal_child(True)
+        return False
 
     def _on_close_request(self, _window: "MainWindow") -> bool:
         self._save_current_settings()
@@ -383,6 +439,11 @@ class MainWindow(Adw.ApplicationWindow):
             .warning-card {
                 background: alpha(@warning_bg_color, 0.14);
             }
+            textview.terminal-view > text {
+                background: #0d0f0b;
+                color: #c8d8b8;
+                caret-color: #c8d8b8;
+            }
             """
         )
         Gtk.StyleContext.add_provider_for_display(
@@ -413,7 +474,11 @@ class MainWindow(Adw.ApplicationWindow):
             ("tests", "Live Tests", "media-playback-start-symbolic"),
             ("history", "Generate", "document-edit-symbolic"),
             ("settings", "Settings", "preferences-system-symbolic"),
+            ("pacman", "Pacman", "preferences-other-symbolic"),
             ("chaotic", "Chaotic AUR", "package-x-generic-symbolic"),
+            ("update", "Update", "software-update-available-symbolic"),
+            ("log", "Pacman Log", "document-open-recent-symbolic"),
+            ("pacnew", "pacnew Files", "dialog-warning-symbolic"),
             ("about", "About", "help-about-symbolic"),
         ]
         for page_id, label, icon_name in pages:
@@ -428,6 +493,12 @@ class MainWindow(Adw.ApplicationWindow):
             lbl.set_hexpand(True)
             row_box.append(icon)
             row_box.append(lbl)
+            if page_id == "update":
+                self._update_badge = Gtk.Label()
+                self._update_badge.add_css_class("pill")
+                self._update_badge.add_css_class("accent")
+                self._update_badge.set_visible(False)
+                row_box.append(self._update_badge)
             row.set_child(row_box)
             self.nav.append(row)
 
@@ -446,7 +517,11 @@ class MainWindow(Adw.ApplicationWindow):
         self.stack.add_named(self._build_tests(), "tests")
         self.stack.add_named(self._build_settings(), "settings")
         self.stack.add_named(self._build_history(), "history")
+        self.stack.add_named(self._build_pacman(), "pacman")
         self.stack.add_named(self._build_chaotic(), "chaotic")
+        self.stack.add_named(self._build_update(), "update")
+        self.stack.add_named(self._build_log(), "log")
+        self.stack.add_named(self._build_pacnew(), "pacnew")
         self.stack.add_named(self._build_about(), "about")
 
         clamp = Adw.Clamp(maximum_size=1100, tightening_threshold=820)
@@ -607,6 +682,16 @@ class MainWindow(Adw.ApplicationWindow):
         actions.append(self._apply_button)
         actions.append(restore_button)
         box.append(actions)
+
+        self._comparison_revealer = Gtk.Revealer()
+        self._comparison_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
+        self._comparison_revealer.set_transition_duration(300)
+        self._comparison_revealer.set_reveal_child(False)
+        self._comparison_inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        self._comparison_inner.set_margin_top(4)
+        self._comparison_inner.set_margin_bottom(4)
+        self._comparison_revealer.set_child(self._comparison_inner)
+        box.append(self._comparison_revealer)
 
         self.command_row = Adw.ActionRow(title="Generated With")
         self.generated_row = Adw.ActionRow(title="Generated At")
@@ -797,6 +882,9 @@ class MainWindow(Adw.ApplicationWindow):
                     self.nav.select_row(row)
                 break
             row = row.get_next_sibling()
+        if page_id == "log" and not getattr(self, "_log_loaded", False):
+            self._log_loaded = True
+            self._log_load_fn()
 
     def _refresh_views(self) -> None:
         self._refresh_dashboard()
@@ -1058,6 +1146,178 @@ class MainWindow(Adw.ApplicationWindow):
             include_isos=self.isos_switch.get_active(),
         )
 
+    def _populate_comparison(self, preview_text: str) -> None:
+        def do_read() -> None:
+            current_mirrors, _ = parse_current_mirrorlist()
+            GLib.idle_add(self._populate_comparison_ui, preview_text, current_mirrors)
+
+        threading.Thread(target=do_read, daemon=True).start()
+
+    def _populate_comparison_ui(self, preview_text: str, current_mirrors: list) -> bool:
+        def _host(url: str) -> str:
+            return urlparse(url).hostname or url
+        current_urls = [m.url for m in current_mirrors]
+        preview_urls = re.findall(r"^Server\s*=\s*(.+)", preview_text, re.MULTILINE)
+
+        current_hosts = {_host(u) for u in current_urls}
+        preview_hosts_list = [_host(u) for u in preview_urls]
+        preview_hosts = set(preview_hosts_list)
+
+        new_hosts = preview_hosts - current_hosts
+        removed_hosts = current_hosts - preview_hosts
+        common_hosts = current_hosts & preview_hosts
+
+        current_https = sum(1 for u in current_urls if u.startswith("https"))
+        preview_https = sum(1 for u in preview_urls if u.startswith("https"))
+        cur_https_pct = round(100 * current_https / len(current_urls)) if current_urls else 0
+        prev_https_pct = round(100 * preview_https / len(preview_urls)) if preview_urls else 0
+
+        mirror_by_host: dict[str, object] = {_host(m.url): m for m in self.mirror_source.mirrors}
+
+        cur_countries = {mirror_by_host[h].country for h in current_hosts if h in mirror_by_host}  # type: ignore[attr-defined]
+        prev_countries = {mirror_by_host[h].country for h in preview_hosts if h in mirror_by_host}  # type: ignore[attr-defined]
+
+        def _avg_lat(hosts: set) -> int:
+            lats = [mirror_by_host[h].latency_ms for h in hosts if h in mirror_by_host and mirror_by_host[h].latency_ms > 0]  # type: ignore[attr-defined]
+            return sum(lats) // len(lats) if lats else 0
+
+        cur_lat = _avg_lat(current_hosts)
+        prev_lat = _avg_lat(preview_hosts)
+
+        score = 0
+        n_cur, n_prev = len(current_urls), len(preview_urls)
+        if n_prev > n_cur:
+            score += 2
+        elif n_prev == n_cur:
+            score += 1
+        if prev_https_pct >= cur_https_pct:
+            score += 1
+        if cur_lat > 0 and prev_lat < cur_lat:
+            score += 1
+        if len(prev_countries) >= len(cur_countries):
+            score += 1
+
+        if score >= 4:
+            verdict, verdict_sub, verdict_icon = (
+                "Recommended to apply",
+                f"{len(new_hosts)} new mirror{'s' if len(new_hosts) != 1 else ''}, improved coverage",
+                "emblem-default-symbolic",
+            )
+        elif score >= 2:
+            verdict, verdict_sub, verdict_icon = (
+                "Marginal improvement",
+                "Similar quality to current list",
+                "dialog-information-symbolic",
+            )
+        else:
+            verdict, verdict_sub, verdict_icon = (
+                "Consider keeping current",
+                "Preview list may not improve on current",
+                "dialog-warning-symbolic",
+            )
+
+        child = self._comparison_inner.get_first_child()
+        while child:
+            nxt = child.get_next_sibling()
+            self._comparison_inner.remove(child)
+            child = nxt
+
+        # ── Verdict banner ────────────────────────────────────────────
+        banner = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
+        banner.add_css_class("card")
+        icon = Gtk.Image.new_from_icon_name(verdict_icon)
+        icon.set_pixel_size(32)
+        icon.set_valign(Gtk.Align.CENTER)
+        txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        txt.set_hexpand(True)
+        txt.set_valign(Gtk.Align.CENTER)
+        hl = Gtk.Label(label=verdict, xalign=0)
+        hl.add_css_class("title-3")
+        sl = Gtk.Label(label=verdict_sub, xalign=0)
+        sl.add_css_class("dim-label")
+        txt.append(hl)
+        txt.append(sl)
+        banner.append(icon)
+        banner.append(txt)
+        self._comparison_inner.append(banner)
+
+        # ── Stat cards ────────────────────────────────────────────────
+        delta = n_prev - n_cur
+        delta_str = (f"+{delta}" if delta > 0 else str(delta)) if delta != 0 else "no change"
+        lat_detail = (
+            f"{'−' if prev_lat < cur_lat else '+'}{abs(prev_lat - cur_lat)} ms vs current"
+            if cur_lat and prev_lat
+            else (f"avg {prev_lat} ms" if prev_lat else "no data")
+        )
+        cards = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        for title, value, detail in (
+            ("Mirrors",     f"{n_cur} → {n_prev}",                    delta_str),
+            ("HTTPS",       f"{cur_https_pct}% → {prev_https_pct}%",  "protocol coverage"),
+            ("Countries",   f"{len(cur_countries)} → {len(prev_countries)}", "unique countries"),
+            ("Avg Latency", f"{prev_lat} ms" if prev_lat else "—",    lat_detail),
+        ):
+            cards.append(StatCard(title, value, detail))
+        self._comparison_inner.append(cards)
+
+        # ── Changes summary ───────────────────────────────────────────
+        chg_grp = Adw.PreferencesGroup(title="Changes")
+        for label, count, icon_name in (
+            ("New mirrors",     len(new_hosts),     "list-add-symbolic"),
+            ("Removed mirrors", len(removed_hosts), "list-remove-symbolic"),
+            ("Common mirrors",  len(common_hosts),  "emblem-shared-symbolic"),
+        ):
+            row = Adw.ActionRow(title=label, subtitle=str(count))
+            img = Gtk.Image.new_from_icon_name(icon_name)
+            img.set_pixel_size(16)
+            row.add_prefix(img)
+            chg_grp.add(row)
+        self._comparison_inner.append(chg_grp)
+
+        # ── Top preview mirrors ───────────────────────────────────────
+        top_grp = Adw.PreferencesGroup(title=f"Preview Mirrorlist  ({n_prev} mirrors)")
+        for url in preview_urls[:6]:
+            h = _host(url)
+            m = mirror_by_host.get(h)
+            row = Adw.ActionRow(title=h, subtitle=url)
+            row.set_subtitle_selectable(True)
+            if h in new_hosts:
+                badge = Gtk.Label(label="new")
+                badge.add_css_class("pill")
+                badge.add_css_class("accent")
+                row.add_prefix(badge)
+            if m:
+                chips = Gtk.Box(spacing=6)
+                chips.set_valign(Gtk.Align.CENTER)
+                lat_chip = Gtk.Label(label=f"{m.latency_ms} ms")  # type: ignore[attr-defined]
+                lat_chip.add_css_class("pill")
+                cty = Gtk.Label(label=m.country)  # type: ignore[attr-defined]
+                cty.add_css_class("dim-label")
+                cty.add_css_class("caption")
+                chips.append(lat_chip)
+                chips.append(cty)
+                row.add_suffix(chips)
+            top_grp.add(row)
+        if n_prev > 6:
+            more = Adw.ActionRow(title=f"… and {n_prev - 6} more")
+            top_grp.add(more)
+        self._comparison_inner.append(top_grp)
+
+        # ── New mirrors detail ────────────────────────────────────────
+        if new_hosts:
+            new_grp = Adw.PreferencesGroup(title=f"New Mirrors  ({len(new_hosts)})")
+            for h in sorted(new_hosts):
+                m = mirror_by_host.get(h)
+                row = Adw.ActionRow(title=h)
+                if m:
+                    row.set_subtitle(
+                        f"{m.country}  ·  {m.latency_ms} ms  ·  {m.protocol}"  # type: ignore[attr-defined]
+                    )
+                new_grp.add(row)
+            self._comparison_inner.append(new_grp)
+
+        self._comparison_revealer.set_reveal_child(True)
+        return False
+
     def _generate_preview(self, _button: Gtk.Button) -> None:
         self._generate_button.set_sensitive(False)
         self._apply_button.set_sensitive(False)
@@ -1086,11 +1346,13 @@ class MainWindow(Adw.ApplicationWindow):
             self.preview_detail_row.set_subtitle(result.message)
             self.generated_buffer.set_text(result.mirrorlist_text)
             self.diff_buffer.set_text(result.diff_text)
+            self._populate_comparison(result.mirrorlist_text)
         else:
             self.preview_status_row.set_subtitle("Preview generation failed")
             self.preview_detail_row.set_subtitle(result.message.splitlines()[0])
             self.generated_buffer.set_text("Generation failed.")
             self.diff_buffer.set_text(result.message)
+            self._comparison_revealer.set_reveal_child(False)
         return False
 
     def _apply_generated_mirrorlist(self, _button: Gtk.Button) -> None:
@@ -1193,11 +1455,559 @@ class MainWindow(Adw.ApplicationWindow):
 
         dialog.present()
 
+    def _build_pacman(self) -> Gtk.Widget:
+        from vs_reflector_manager.pacman_conf_services import (
+            PacmanOptions,
+            apply_pacman_options,
+            read_pacman_options,
+        )
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_hexpand(True)
+        scroll.set_vexpand(True)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        box.set_margin_top(20)
+        box.set_margin_bottom(20)
+        box.set_margin_start(20)
+        box.set_margin_end(20)
+
+        header_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        window_title = Adw.WindowTitle(
+            title="Pacman",
+            subtitle="/etc/pacman.conf options and repositories",
+        )
+        window_title.set_hexpand(True)
+        refresh_btn = Gtk.Button(icon_name="view-refresh-symbolic")
+        refresh_btn.set_tooltip_text("Reload from disk")
+        refresh_btn.set_valign(Gtk.Align.CENTER)
+        header_row.append(window_title)
+        header_row.append(refresh_btn)
+        box.append(header_row)
+
+        # ── Options group ──────────────────────────────────────────────────
+        opts_group = Adw.PreferencesGroup(title="Options")
+
+        color_row = Adw.ActionRow(
+            title="Color",
+            subtitle="Colorized output in the terminal",
+        )
+        color_sw = Gtk.Switch()
+        color_sw.set_valign(Gtk.Align.CENTER)
+        color_row.add_suffix(color_sw)
+        color_row.set_activatable_widget(color_sw)
+        opts_group.add(color_row)
+
+        verbose_row = Adw.ActionRow(
+            title="VerbosePkgLists",
+            subtitle="Show old and new package versions in upgrade list",
+        )
+        verbose_sw = Gtk.Switch()
+        verbose_sw.set_valign(Gtk.Align.CENTER)
+        verbose_row.add_suffix(verbose_sw)
+        verbose_row.set_activatable_widget(verbose_sw)
+        opts_group.add(verbose_row)
+
+        candy_row = Adw.ActionRow(
+            title="ILoveCandy",
+            subtitle="Pac-Man progress bar instead of ####",
+        )
+        candy_sw = Gtk.Switch()
+        candy_sw.set_valign(Gtk.Align.CENTER)
+        candy_row.add_suffix(candy_sw)
+        candy_row.set_activatable_widget(candy_sw)
+        opts_group.add(candy_row)
+
+        parallel_row = Adw.ActionRow(
+            title="Parallel Downloads",
+            subtitle="Simultaneous package downloads",
+        )
+        parallel_spin = Gtk.SpinButton()
+        parallel_spin.set_adjustment(Gtk.Adjustment(value=5, lower=1, upper=20, step_increment=1))
+        parallel_spin.set_valign(Gtk.Align.CENTER)
+        parallel_row.add_suffix(parallel_spin)
+        opts_group.add(parallel_row)
+
+        box.append(opts_group)
+
+        # ── Repositories group ─────────────────────────────────────────────
+        repos_group = Adw.PreferencesGroup(
+            title="Repositories",
+            description="Changes take effect on next pacman operation",
+        )
+
+        repo_switches: dict[str, Gtk.Switch] = {}
+        for repo_id, title, subtitle in (
+            ("multilib", "multilib", "32-bit package support on x86_64"),
+            ("core-testing", "core-testing", "Testing packages for [core]"),
+            ("extra-testing", "extra-testing", "Testing packages for [extra]"),
+            ("multilib-testing", "multilib-testing", "Testing packages for [multilib]"),
+        ):
+            row = Adw.ActionRow(title=title, subtitle=subtitle)
+            sw = Gtk.Switch()
+            sw.set_valign(Gtk.Align.CENTER)
+            row.add_suffix(sw)
+            row.set_activatable_widget(sw)
+            repos_group.add(row)
+            repo_switches[repo_id] = sw
+
+        box.append(repos_group)
+
+        # ── Apply button ───────────────────────────────────────────────────
+        apply_btn = Gtk.Button(label="Apply Changes")
+        apply_btn.add_css_class("suggested-action")
+        apply_btn.set_halign(Gtk.Align.START)
+        box.append(apply_btn)
+
+        def _load_options() -> None:
+            def do_read() -> None:
+                opts = read_pacman_options()
+                GLib.idle_add(_apply_opts, opts)
+
+            def _apply_opts(opts) -> bool:
+                color_sw.set_active(opts.color)
+                verbose_sw.set_active(opts.verbose_pkg_lists)
+                candy_sw.set_active(opts.i_love_candy)
+                parallel_spin.set_value(opts.parallel_downloads)
+                repo_switches["multilib"].set_active(opts.multilib)
+                repo_switches["core-testing"].set_active(opts.core_testing)
+                repo_switches["extra-testing"].set_active(opts.extra_testing)
+                repo_switches["multilib-testing"].set_active(opts.multilib_testing)
+                return False
+
+            threading.Thread(target=do_read, daemon=True).start()
+
+        def _on_apply(_btn: Gtk.Button) -> None:
+            apply_btn.set_sensitive(False)
+            options = PacmanOptions(
+                color=color_sw.get_active(),
+                parallel_downloads=int(parallel_spin.get_value()),
+                verbose_pkg_lists=verbose_sw.get_active(),
+                i_love_candy=candy_sw.get_active(),
+                multilib=repo_switches["multilib"].get_active(),
+                core_testing=repo_switches["core-testing"].get_active(),
+                extra_testing=repo_switches["extra-testing"].get_active(),
+                multilib_testing=repo_switches["multilib-testing"].get_active(),
+            )
+
+            def do_apply() -> None:
+                result = apply_pacman_options(options)
+                GLib.idle_add(_on_done, result)
+
+            def _on_done(result) -> bool:
+                apply_btn.set_sensitive(True)
+                if result.success:
+                    self._show_toast("pacman.conf updated.")
+                    _load_options()
+                else:
+                    self._show_toast(result.message.splitlines()[0], timeout=6)
+                return False
+
+            threading.Thread(target=do_apply, daemon=True).start()
+
+        refresh_btn.connect("clicked", lambda _b: _load_options())
+        apply_btn.connect("clicked", _on_apply)
+        _load_options()
+
+        # ── Orphaned packages ──────────────────────────────────────────────────
+        orphan_grp = Adw.PreferencesGroup(
+            title="Orphaned Packages",
+            description="Installed as dependencies, no longer required by any package",
+        )
+        orphan_list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+
+        orphan_scan_btn = Gtk.Button(label="Scan for Orphans")
+        orphan_scan_btn.set_halign(Gtk.Align.START)
+        orphan_remove_btn = Gtk.Button(label="Remove Selected")
+        orphan_remove_btn.add_css_class("destructive-action")
+        orphan_remove_btn.set_halign(Gtk.Align.START)
+        orphan_remove_btn.set_sensitive(False)
+
+        orphan_btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        orphan_btns.append(orphan_scan_btn)
+        orphan_btns.append(orphan_remove_btn)
+
+        _orphan_checks: list[tuple[str, Gtk.CheckButton]] = []
+
+        def _on_orphan_scan(_btn: Gtk.Button) -> None:
+            orphan_scan_btn.set_sensitive(False)
+            child = orphan_list_box.get_first_child()
+            while child:
+                nxt = child.get_next_sibling()
+                orphan_list_box.remove(child)
+                child = nxt
+            _orphan_checks.clear()
+            orphan_remove_btn.set_sensitive(False)
+
+            def do_scan() -> None:
+                pkgs = get_orphan_packages()
+                GLib.idle_add(_on_scan_done, pkgs)
+
+            def _on_scan_done(pkgs: list[str]) -> bool:
+                orphan_scan_btn.set_sensitive(True)
+                if not pkgs:
+                    lbl = Gtk.Label(label="No orphaned packages found.", xalign=0)
+                    lbl.add_css_class("dim-label")
+                    lbl.set_margin_top(6)
+                    orphan_list_box.append(lbl)
+                    return False
+                for pkg in pkgs:
+                    row = Adw.ActionRow(title=pkg)
+                    cb = Gtk.CheckButton()
+                    cb.set_valign(Gtk.Align.CENTER)
+                    cb.connect("toggled", lambda _c: orphan_remove_btn.set_sensitive(
+                        any(c.get_active() for _, c in _orphan_checks)
+                    ))
+                    row.add_prefix(cb)
+                    _orphan_checks.append((pkg, cb))
+                    orphan_list_box.append(row)
+                return False
+
+            threading.Thread(target=do_scan, daemon=True).start()
+
+        def _on_orphan_remove(_btn: Gtk.Button) -> None:
+            selected = [pkg for pkg, cb in _orphan_checks if cb.get_active()]
+            if not selected:
+                return
+            orphan_remove_btn.set_sensitive(False)
+            orphan_scan_btn.set_sensitive(False)
+
+            def do_remove() -> None:
+                ok, msg = remove_orphans(selected)
+                GLib.idle_add(_on_remove_done, ok, msg)
+
+            def _on_remove_done(ok: bool, msg: str) -> bool:
+                self._show_toast(msg, timeout=5)
+                orphan_scan_btn.set_sensitive(True)
+                if ok:
+                    _on_orphan_scan(orphan_scan_btn)
+                else:
+                    orphan_remove_btn.set_sensitive(True)
+                return False
+
+            threading.Thread(target=do_remove, daemon=True).start()
+
+        orphan_scan_btn.connect("clicked", _on_orphan_scan)
+        orphan_remove_btn.connect("clicked", _on_orphan_remove)
+        box.append(orphan_grp)
+        box.append(orphan_list_box)
+        box.append(orphan_btns)
+
+        scroll.set_child(box)
+        return scroll
+
+    def _build_update(self) -> Gtk.Widget:
+        _proc: list[subprocess.Popen | None] = [None]
+        _start_ts: list[float] = [0.0]
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        outer.set_hexpand(True)
+
+        # ── Header ────────────────────────────────────────────────────
+        header_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        header_box.set_margin_top(20)
+        header_box.set_margin_bottom(12)
+        header_box.set_margin_start(20)
+        header_box.set_margin_end(20)
+
+        win_title = Adw.WindowTitle(title="System Update", subtitle="pacman -Syyuu --noconfirm")
+        win_title.set_hexpand(True)
+
+        clear_btn = Gtk.Button(icon_name="edit-clear-symbolic")
+        clear_btn.set_tooltip_text("Clear output")
+        clear_btn.set_valign(Gtk.Align.CENTER)
+
+        stop_btn = Gtk.Button(label="Stop")
+        stop_btn.add_css_class("destructive-action")
+        stop_btn.set_valign(Gtk.Align.CENTER)
+        stop_btn.set_sensitive(False)
+
+        run_btn = Gtk.Button(label="Run Update")
+        run_btn.add_css_class("suggested-action")
+        run_btn.set_valign(Gtk.Align.CENTER)
+
+        header_box.append(win_title)
+        header_box.append(clear_btn)
+        header_box.append(stop_btn)
+        header_box.append(run_btn)
+
+        # ── Terminal ──────────────────────────────────────────────────
+        terminal_scroll = Gtk.ScrolledWindow()
+        terminal_scroll.set_hexpand(True)
+        terminal_scroll.set_size_request(-1, 440)
+        terminal_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+
+        tv = Gtk.TextView()
+        tv.set_editable(False)
+        tv.set_cursor_visible(False)
+        tv.set_monospace(True)
+        tv.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        tv.set_left_margin(12)
+        tv.set_right_margin(12)
+        tv.set_top_margin(12)
+        tv.set_bottom_margin(12)
+        tv.add_css_class("terminal-view")
+        terminal_scroll.set_child(tv)
+
+        buf = tv.get_buffer()
+        end_mark = buf.create_mark("end", buf.get_end_iter(), False)
+
+        # ── Stats panel (revealed after completion) ───────────────────
+        stats_revealer = Gtk.Revealer()
+        stats_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
+        stats_revealer.set_transition_duration(300)
+        stats_revealer.set_reveal_child(False)
+        stats_revealer.set_hexpand(True)
+
+        stats_scroll = Gtk.ScrolledWindow()
+        stats_scroll.set_hexpand(True)
+        stats_scroll.set_size_request(-1, 480)
+        stats_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+
+        stats_inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        stats_inner.set_margin_top(16)
+        stats_inner.set_margin_bottom(20)
+        stats_inner.set_margin_start(20)
+        stats_inner.set_margin_end(20)
+        stats_scroll.set_child(stats_inner)
+        stats_revealer.set_child(stats_scroll)
+
+        # ── Stats population ──────────────────────────────────────────
+        def _populate_stats(text: str, rc: int | None, elapsed: float) -> None:
+            child = stats_inner.get_first_child()
+            while child:
+                nxt = child.get_next_sibling()
+                stats_inner.remove(child)
+                child = nxt
+
+            up_to_date = "there is nothing to do" in text.lower()
+
+            m = re.search(r"Packages \((\d+)\)", text)
+            pkg_count = int(m.group(1)) if m else 0
+
+            m = re.search(r"Total Download Size:\s+([\d.]+ \S+)", text)
+            download_size = m.group(1) if m else "—"
+
+            m = re.search(r"Total Installed Size:\s+([\d.]+ \S+)", text)
+            installed_size = m.group(1) if m else "—"
+
+            m = re.search(r"Net Upgrade Size:\s+([\d.]+ \S+)", text)
+            net_size = m.group(1) if m else "—"
+
+            upgraded    = re.findall(r"\(\d+/\d+\) upgrading\s+(\S+)",   text)
+            installed_p = re.findall(r"\(\d+/\d+\) installing\s+(\S+)",  text)
+            removed_p   = re.findall(r"\(\d+/\d+\) removing\s+(\S+)",    text)
+            downgraded  = re.findall(r"\(\d+/\d+\) downgrading\s+(\S+)", text)
+            reinstalled = re.findall(r"\(\d+/\d+\) reinstalling\s+(\S+)", text)
+
+            db_refreshed  = re.findall(r"^\s+(\S+)\s+[\d.]+\s+\S+iB", text, re.MULTILINE)
+            db_uptodate   = re.findall(r"^\s+(\S+) is up to date", text, re.MULTILINE)
+
+            warnings = re.findall(r"^warning:\s+(.+)$", text, re.MULTILINE)
+            errors   = re.findall(r"^error:\s+(.+)$",   text, re.MULTILINE)
+
+            total_changed = len(upgraded) + len(installed_p) + len(removed_p) + len(downgraded) + len(reinstalled)
+
+            mins = int(elapsed) // 60
+            secs = int(elapsed) % 60
+            elapsed_str = f"{mins}m {secs}s" if mins else f"{secs}s"
+
+            # ── Status banner ──────────────────────────────────────────
+            banner = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
+            banner.add_css_class("card")
+            banner.set_margin_top(4)
+            banner.set_margin_bottom(4)
+
+            if rc == 0 and up_to_date:
+                icon_name = "emblem-default-symbolic"
+                headline = "System is up to date"
+                sub_txt  = f"No packages to upgrade  ·  {elapsed_str}"
+            elif rc == 0:
+                icon_name = "software-update-available-symbolic"
+                headline = f"{total_changed} package{'s' if total_changed != 1 else ''} updated"
+                sub_txt  = f"Completed in {elapsed_str}"
+            else:
+                icon_name = "dialog-warning-symbolic"
+                headline = "Update did not complete"
+                sub_txt  = f"Exit code {rc}  ·  {elapsed_str}"
+
+            icon = Gtk.Image.new_from_icon_name(icon_name)
+            icon.set_pixel_size(36)
+            icon.set_valign(Gtk.Align.CENTER)
+
+            text_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            text_col.set_valign(Gtk.Align.CENTER)
+            text_col.set_hexpand(True)
+            hl = Gtk.Label(label=headline, xalign=0)
+            hl.add_css_class("title-3")
+            sl = Gtk.Label(label=sub_txt, xalign=0)
+            sl.add_css_class("dim-label")
+            text_col.append(hl)
+            text_col.append(sl)
+            banner.append(icon)
+            banner.append(text_col)
+            stats_inner.append(banner)
+
+            # ── Stat cards ─────────────────────────────────────────────
+            cards_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+            n_in_txn = total_changed if total_changed else pkg_count
+            for title, value, detail in (
+                ("Duration",    elapsed_str,   "wall clock"),
+                ("Packages",    str(n_in_txn), "in transaction"),
+                ("Downloaded",  download_size, "from mirrors"),
+                ("Disk change", net_size,      "net size delta"),
+                ("Installed",   installed_size,"total on disk"),
+            ):
+                cards_row.append(StatCard(title, value, detail))
+            stats_inner.append(cards_row)
+
+            # ── Package groups ─────────────────────────────────────────
+            for grp_title, pkg_list, icon_str in (
+                ("Upgraded",    upgraded,    "software-update-available-symbolic"),
+                ("Installed",   installed_p, "list-add-symbolic"),
+                ("Reinstalled", reinstalled, "view-refresh-symbolic"),
+                ("Downgraded",  downgraded,  "go-down-symbolic"),
+                ("Removed",     removed_p,   "list-remove-symbolic"),
+            ):
+                if not pkg_list:
+                    continue
+                grp = Adw.PreferencesGroup(title=f"{grp_title}  ({len(pkg_list)})")
+                for name in pkg_list:
+                    row = Adw.ActionRow(title=name)
+                    img = Gtk.Image.new_from_icon_name(icon_str)
+                    img.set_pixel_size(16)
+                    row.add_prefix(img)
+                    grp.add(row)
+                stats_inner.append(grp)
+
+            # ── Database sync ──────────────────────────────────────────
+            if db_refreshed or db_uptodate:
+                db_grp = Adw.PreferencesGroup(title="Databases")
+                for db in db_refreshed:
+                    row = Adw.ActionRow(title=db, subtitle="refreshed")
+                    img = Gtk.Image.new_from_icon_name("network-transmit-receive-symbolic")
+                    img.set_pixel_size(16)
+                    row.add_prefix(img)
+                    db_grp.add(row)
+                for db in db_uptodate:
+                    row = Adw.ActionRow(title=db, subtitle="up to date")
+                    img = Gtk.Image.new_from_icon_name("emblem-default-symbolic")
+                    img.set_pixel_size(16)
+                    row.add_prefix(img)
+                    db_grp.add(row)
+                stats_inner.append(db_grp)
+
+            # ── Warnings ───────────────────────────────────────────────
+            if warnings:
+                w_grp = Adw.PreferencesGroup(title=f"Warnings  ({len(warnings)})")
+                for w in warnings:
+                    row = Adw.ActionRow(title=w)
+                    img = Gtk.Image.new_from_icon_name("dialog-warning-symbolic")
+                    img.set_pixel_size(16)
+                    row.add_prefix(img)
+                    w_grp.add(row)
+                stats_inner.append(w_grp)
+
+            # ── Errors ────────────────────────────────────────────────
+            if errors:
+                e_grp = Adw.PreferencesGroup(title=f"Errors  ({len(errors)})")
+                for e in errors:
+                    row = Adw.ActionRow(title=e)
+                    img = Gtk.Image.new_from_icon_name("dialog-error-symbolic")
+                    img.set_pixel_size(16)
+                    row.add_prefix(img)
+                    e_grp.add(row)
+                stats_inner.append(e_grp)
+
+        # ── Callbacks ─────────────────────────────────────────────────
+        def _append(text: str) -> bool:
+            clean = _ANSI_RE.sub("", text)
+            buf.insert(buf.get_end_iter(), clean)
+            tv.scroll_to_mark(end_mark, 0.0, False, 0.0, 1.0)
+            return False
+
+        def _on_done(rc: int | None, elapsed: float) -> bool:
+            _proc[0] = None
+            run_btn.set_sensitive(True)
+            stop_btn.set_sensitive(False)
+            _append("\n── Update complete ──\n" if rc == 0 else f"\n── Exited with code {rc} ──\n")
+            full = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+            _populate_stats(full, rc, elapsed)
+            terminal_scroll.set_size_request(-1, 220)
+            stats_revealer.set_reveal_child(True)
+            if rc == 0:
+                threading.Thread(target=self._bg_check_updates, daemon=True).start()
+            return False
+
+        def _run(_btn: Gtk.Button) -> None:
+            buf.set_text("")
+            stats_revealer.set_reveal_child(False)
+            terminal_scroll.set_size_request(-1, 440)
+            run_btn.set_sensitive(False)
+            stop_btn.set_sensitive(True)
+            _start_ts[0] = _time.monotonic()
+
+            def do_run() -> None:
+                try:
+                    proc = subprocess.Popen(
+                        ["pkexec", "pacman", "-Syyuu", "--noconfirm"],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        bufsize=1,
+                    )
+                    _proc[0] = proc
+                    if proc.stdout is None:
+                        GLib.idle_add(_on_done, None, _time.monotonic() - _start_ts[0])
+                        return
+                    for line in proc.stdout:
+                        GLib.idle_add(_append, line)
+                    proc.wait()
+                    elapsed = _time.monotonic() - _start_ts[0]
+                    GLib.idle_add(_on_done, proc.returncode, elapsed)
+                except Exception as exc:
+                    elapsed = _time.monotonic() - _start_ts[0]
+                    GLib.idle_add(_append, f"\nError: {exc}\n")
+                    GLib.idle_add(_on_done, None, elapsed)
+
+            threading.Thread(target=do_run, daemon=True).start()
+
+        def _stop(_btn: Gtk.Button) -> None:
+            if _proc[0] is not None:
+                _proc[0].terminate()
+
+        def _clear(_btn: Gtk.Button) -> None:
+            buf.set_text("")
+            stats_revealer.set_reveal_child(False)
+            terminal_scroll.set_size_request(-1, 440)
+
+        run_btn.connect("clicked", _run)
+        stop_btn.connect("clicked", _stop)
+        clear_btn.connect("clicked", _clear)
+
+        self._news_revealer = Gtk.Revealer()
+        self._news_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
+        self._news_revealer.set_transition_duration(300)
+        self._news_revealer.set_reveal_child(False)
+        self._news_inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self._news_inner.set_margin_top(12)
+        self._news_inner.set_margin_bottom(4)
+        self._news_inner.set_margin_start(20)
+        self._news_inner.set_margin_end(20)
+        self._news_revealer.set_child(self._news_inner)
+
+        outer.append(header_box)
+        outer.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+        outer.append(self._news_revealer)
+        outer.append(terminal_scroll)
+        outer.append(stats_revealer)
+        return outer
 
     def _build_chaotic(self) -> Gtk.Widget:
         from vs_reflector_manager.chaotic_services import PACMAN_CONF_SNIPPET, SETUP_COMMANDS, detect_state
 
-        self._chaotic_state = detect_state()
+        self._chaotic_state = "unknown"
         self._chaotic_mirrors: list = []
         self._chaotic_mirror_rows: list[ChaoticMirrorRow] = []
         self._chaotic_probe_session = 0
@@ -1316,11 +2126,32 @@ class MainWindow(Adw.ApplicationWindow):
         self._chaotic_mirrors_group = Adw.PreferencesGroup(title="Mirrors")
         box.append(self._chaotic_mirrors_group)
 
-        self._update_chaotic_ui()
+        GLib.idle_add(self._chaotic_load_state)
         return box
+
+    def _chaotic_load_state(self) -> bool:
+        from vs_reflector_manager.chaotic_services import detect_state as _detect_state
+        def do_detect():
+            state = _detect_state()
+            GLib.idle_add(self._chaotic_apply_state, state)
+        threading.Thread(target=do_detect, daemon=True).start()
+        return False
+
+    def _chaotic_apply_state(self, state) -> bool:
+        self._chaotic_state = state
+        self._update_chaotic_ui()
+        return False
 
     def _update_chaotic_ui(self) -> None:
         state = self._chaotic_state
+        if isinstance(state, str):
+            self._chaotic_installed_row.set_subtitle("Loading…")
+            self._chaotic_configured_row.set_subtitle("Loading…")
+            self._chaotic_setup_section.set_visible(False)
+            self._chaotic_config_section.set_visible(False)
+            self._chaotic_actions.set_visible(False)
+            self._chaotic_mirrors_group.set_visible(False)
+            return
         installed = state.installed
         configured = state.configured
 
@@ -1357,10 +2188,17 @@ class MainWindow(Adw.ApplicationWindow):
         self._chaotic_apply_best_btn.set_sensitive(False)
 
     def _refresh_chaotic_state(self, _button: Gtk.Button) -> None:
-        from vs_reflector_manager.chaotic_services import detect_state
-        self._chaotic_state = detect_state()
+        from vs_reflector_manager.chaotic_services import detect_state as _detect_state
+        self._chaotic_state = "unknown"
         self._update_chaotic_ui()
-        self._show_toast("Chaotic AUR status refreshed.")
+        def do_detect():
+            state = _detect_state()
+            def _done():
+                self._chaotic_apply_state(state)
+                self._show_toast("Chaotic AUR status refreshed.")
+                return False
+            GLib.idle_add(_done)
+        threading.Thread(target=do_detect, daemon=True).start()
 
     def _on_chaotic_mirror_toggled(self, mirror, active: bool) -> None:
         mirror.active = active
@@ -1508,6 +2346,292 @@ class MainWindow(Adw.ApplicationWindow):
         self.get_display().get_clipboard().set(text)
         self._show_toast("Copied to clipboard.")
 
+    # ── Pacman Log ────────────────────────────────────────────────────────────
+
+    def _build_log(self) -> Gtk.Widget:
+        _ACTION_ICONS = {
+            "installed":   "list-add-symbolic",
+            "upgraded":    "software-update-available-symbolic",
+            "removed":     "list-remove-symbolic",
+            "downgraded":  "go-down-symbolic",
+            "reinstalled": "view-refresh-symbolic",
+        }
+        _ALL_ACTIONS = list(_ACTION_ICONS.keys())
+        _active_filter: list[str | None] = [None]
+        _all_entries: list[list[dict]] = [[]]
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        box.set_margin_top(20)
+        box.set_margin_bottom(20)
+        box.set_margin_start(20)
+        box.set_margin_end(20)
+
+        header_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        win_title = Adw.WindowTitle(title="Pacman Log", subtitle="/var/log/pacman.log")
+        win_title.set_hexpand(True)
+        reload_btn = Gtk.Button(icon_name="view-refresh-symbolic")
+        reload_btn.set_valign(Gtk.Align.CENTER)
+        reload_btn.set_tooltip_text("Reload log")
+        header_row.append(win_title)
+        header_row.append(reload_btn)
+        box.append(header_row)
+
+        # ── Filter chips ────────────────────────────────────────────
+        filter_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        filter_box.set_margin_bottom(4)
+        _filter_btns: dict[str | None, Gtk.ToggleButton] = {}
+        all_btn = Gtk.ToggleButton(label="All")
+        all_btn.set_active(True)
+        all_btn.add_css_class("pill")
+        filter_box.append(all_btn)
+        _filter_btns[None] = all_btn
+        for action in _ALL_ACTIONS:
+            btn = Gtk.ToggleButton(label=action.capitalize())
+            btn.add_css_class("pill")
+            filter_box.append(btn)
+            _filter_btns[action] = btn
+        box.append(filter_box)
+
+        # ── Stats cards ─────────────────────────────────────────────
+        stats_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        _stat_cards: dict[str, StatCard] = {}
+        for action in _ALL_ACTIONS:
+            sc = StatCard(action.capitalize(), "0", "packages")
+            _stat_cards[action] = sc
+            stats_row.append(sc)
+        box.append(stats_row)
+
+        # ── Entry list ──────────────────────────────────────────────
+        list_group = Adw.PreferencesGroup()
+        box.append(list_group)
+
+        def _rebuild_list() -> None:
+            child = list_group.get_first_child()
+            while child:
+                nxt = child.get_next_sibling()
+                list_group.remove(child)
+                child = nxt
+
+            filt = _active_filter[0]
+            entries = [e for e in _all_entries[0] if filt is None or e["action"] == filt]
+
+            for entry in entries[:200]:
+                row = Adw.ActionRow(title=entry["pkg"], subtitle=entry["date"])
+                img = Gtk.Image.new_from_icon_name(_ACTION_ICONS.get(entry["action"], "package-x-generic-symbolic"))
+                img.set_pixel_size(16)
+                row.add_prefix(img)
+                ver_lbl = Gtk.Label(label=entry["version"])
+                ver_lbl.add_css_class("dim-label")
+                ver_lbl.add_css_class("caption")
+                ver_lbl.set_valign(Gtk.Align.CENTER)
+                row.add_suffix(ver_lbl)
+                list_group.add(row)
+
+            if len(entries) > 200:
+                more = Adw.ActionRow(title=f"… {len(entries) - 200} more entries (showing newest 200)")
+                list_group.add(more)
+
+            if not entries:
+                empty = Adw.ActionRow(title="No entries found")
+                list_group.add(empty)
+
+        def _load_log() -> None:
+            reload_btn.set_sensitive(False)
+
+            def do_parse() -> None:
+                entries = parse_pacman_log()
+                GLib.idle_add(_apply_log, entries)
+
+            def _apply_log(entries: list[dict]) -> bool:
+                _all_entries[0] = entries
+                counts = {a: sum(1 for e in entries if e["action"] == a) for a in _ALL_ACTIONS}
+                for action, sc in _stat_cards.items():
+                    sc.update(str(counts.get(action, 0)), "packages")
+                all_btn.set_label(f"All ({len(entries)})")
+                reload_btn.set_sensitive(True)
+                _rebuild_list()
+                return False
+
+            threading.Thread(target=do_parse, daemon=True).start()
+
+        def _on_filter(action: str | None) -> None:
+            _active_filter[0] = action
+            for key, btn in _filter_btns.items():
+                btn.set_active(key == action)
+            _rebuild_list()
+
+        for action, btn in _filter_btns.items():
+            _action = action
+            btn.connect("toggled", lambda b, a=_action: _on_filter(a) if b.get_active() else None)
+
+        self._log_load_fn = _load_log
+        reload_btn.connect("clicked", lambda _b: _load_log())
+        return box
+
+    # ── pacnew Files ──────────────────────────────────────────────────────────
+
+    def _build_pacnew(self) -> Gtk.Widget:
+        _files: list[list[str]] = [[]]
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        box.set_margin_top(20)
+        box.set_margin_bottom(20)
+        box.set_margin_start(20)
+        box.set_margin_end(20)
+
+        header_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        win_title = Adw.WindowTitle(
+            title="pacnew Files",
+            subtitle="Config files left behind by package updates",
+        )
+        win_title.set_hexpand(True)
+        scan_btn = Gtk.Button(label="Scan /etc")
+        scan_btn.add_css_class("suggested-action")
+        scan_btn.set_valign(Gtk.Align.CENTER)
+        header_row.append(win_title)
+        header_row.append(scan_btn)
+        box.append(header_row)
+
+        desc = Gtk.Label(
+            label=(
+                "pacman leaves .pacnew files when a package update would overwrite a modified config.\n"
+                "Review each file and choose to apply the new version or delete the leftover."
+            ),
+            xalign=0,
+            wrap=True,
+        )
+        desc.add_css_class("dim-label")
+        box.append(desc)
+
+        files_grp = Adw.PreferencesGroup(title="Found Files")
+        box.append(files_grp)
+
+        diff_grp = Adw.PreferencesGroup(title="Diff Preview")
+        diff_scroll = Gtk.ScrolledWindow()
+        diff_scroll.set_min_content_height(200)
+        diff_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        diff_buf = Gtk.TextBuffer()
+        diff_view = Gtk.TextView(buffer=diff_buf)
+        diff_view.set_editable(False)
+        diff_view.set_monospace(True)
+        diff_view.set_wrap_mode(Gtk.WrapMode.NONE)
+        diff_view.add_css_class("code-view")
+        diff_scroll.set_child(diff_view)
+        diff_grp_frame = Gtk.Frame()
+        diff_grp_frame.set_child(diff_scroll)
+        box.append(diff_grp)
+        box.append(diff_grp_frame)
+        diff_grp.set_visible(False)
+        diff_grp_frame.set_visible(False)
+
+        def _show_diff(pacnew_path: str) -> None:
+            def do_diff() -> None:
+                import difflib as _dl
+                original = re.sub(r"\.(pacnew|pacsave)$", "", pacnew_path)
+                try:
+                    with open(original, errors="replace") as f:
+                        orig_lines = f.readlines()
+                except OSError:
+                    orig_lines = []
+                try:
+                    with open(pacnew_path, errors="replace") as f:
+                        new_lines = f.readlines()
+                except OSError:
+                    new_lines = []
+                diff = list(_dl.unified_diff(
+                    orig_lines, new_lines,
+                    fromfile=original, tofile=pacnew_path, lineterm="",
+                ))
+                text = "\n".join(diff) if diff else "No differences."
+                GLib.idle_add(lambda: (
+                    diff_buf.set_text(text),
+                    diff_grp.set_visible(True),
+                    diff_grp_frame.set_visible(True),
+                ) and False)
+
+            threading.Thread(target=do_diff, daemon=True).start()
+
+        def _rebuild_files() -> None:
+            child = files_grp.get_first_child()
+            while child:
+                nxt = child.get_next_sibling()
+                files_grp.remove(child)
+                child = nxt
+            diff_grp.set_visible(False)
+            diff_grp_frame.set_visible(False)
+
+            if not _files[0]:
+                row = Adw.ActionRow(title="No .pacnew or .pacsave files found")
+                files_grp.add(row)
+                return
+
+            files_grp.set_title(f"Found Files  ({len(_files[0])})")
+            for path in _files[0]:
+                row = Adw.ActionRow(title=os.path.basename(path), subtitle=path)
+                row.set_subtitle_selectable(True)
+
+                diff_btn = Gtk.Button(label="Diff")
+                diff_btn.add_css_class("flat")
+                diff_btn.set_valign(Gtk.Align.CENTER)
+                diff_btn.connect("clicked", lambda _b, p=path: _show_diff(p))
+
+                apply_btn = Gtk.Button(label="Apply")
+                apply_btn.add_css_class("suggested-action")
+                apply_btn.set_valign(Gtk.Align.CENTER)
+
+                del_btn = Gtk.Button(icon_name="edit-delete-symbolic")
+                del_btn.add_css_class("destructive-action")
+                del_btn.set_valign(Gtk.Align.CENTER)
+                del_btn.set_tooltip_text("Delete .pacnew")
+
+                def _on_apply(_, p=path) -> None:
+                    def do_apply() -> None:
+                        ok, msg = apply_pacnew(p)
+                        def _done(ok: bool = ok, msg: str = msg) -> bool:
+                            self._show_toast(msg, timeout=5 if not ok else 3)
+                            if ok:
+                                _on_scan(scan_btn)
+                            return False
+                        GLib.idle_add(_done)
+                    threading.Thread(target=do_apply, daemon=True).start()
+
+                def _on_delete(_, p=path) -> None:
+                    def do_del() -> None:
+                        ok, msg = delete_pacnew(p)
+                        def _done(ok: bool = ok, msg: str = msg) -> bool:
+                            self._show_toast(msg, timeout=5 if not ok else 3)
+                            if ok:
+                                _on_scan(scan_btn)
+                            return False
+                        GLib.idle_add(_done)
+                    threading.Thread(target=do_del, daemon=True).start()
+
+                apply_btn.connect("clicked", _on_apply)
+                del_btn.connect("clicked", _on_delete)
+                row.add_suffix(diff_btn)
+                row.add_suffix(apply_btn)
+                row.add_suffix(del_btn)
+                files_grp.add(row)
+
+        def _on_scan(_btn: Gtk.Button) -> None:
+            scan_btn.set_sensitive(False)
+
+            def do_scan() -> None:
+                found = find_pacnew_files()
+                GLib.idle_add(_on_scan_done, found)
+
+            def _on_scan_done(found: list[str]) -> bool:
+                _files[0] = found
+                scan_btn.set_sensitive(True)
+                _rebuild_files()
+                return False
+
+            threading.Thread(target=do_scan, daemon=True).start()
+
+        scan_btn.connect("clicked", _on_scan)
+        _rebuild_files()
+        return box
+
     def _build_about(self) -> Gtk.Widget:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         box.set_margin_top(60)
@@ -1518,7 +2642,7 @@ class MainWindow(Adw.ApplicationWindow):
         # App icon — PNG preferred, fallback to symbolic
         icon_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "vs-reflector-manager.png",
+            "vsreflector-manager.png",
         )
         try:
             pic = Gtk.Picture.new_for_filename(icon_path)

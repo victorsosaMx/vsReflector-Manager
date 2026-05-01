@@ -42,5 +42,12 @@ Initial release.
 - Apply Changes: write toggle selection via pkexec
 - Apply Best Mirror: activate only the fastest probe result
 
+**Pacman**
+- Toggle Color, VerbosePkgLists, ILoveCandy (Pac-Man progress bar animation)
+- Set ParallelDownloads (1–20)
+- Enable/disable optional repos: `[multilib]`, `[core-testing]`, `[extra-testing]`, `[multilib-testing]`
+- Reads current state from `/etc/pacman.conf` on open; applies changes via pkexec (polkit)
+- Preserves comments and unrecognized lines in the config file
+
 **About**
 - App icon, version, author, GitHub and license links

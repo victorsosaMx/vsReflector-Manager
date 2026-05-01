@@ -1,5 +1,5 @@
 [project]
-name = "vs-reflector-manager"
+name = "vsreflector-manager"
 version = "1.0.0"
 description = "Visual mirror manager for Arch Linux built with GTK4 and libadwaita."
 readme = "README.md"

@@ -4,6 +4,7 @@ import email.utils
 import difflib
 import json
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -75,13 +76,17 @@ class MirrorStatusCache:
 
 _mirror_status_cache: MirrorStatusCache | None = None
 _cache_lock = threading.Lock()
+_cache_fetching = False
 
 
 def fetch_mirror_status_from_api() -> MirrorStatusCache | None:
-    global _mirror_status_cache
+    global _mirror_status_cache, _cache_fetching
     with _cache_lock:
         if _mirror_status_cache is not None and time.time() < _mirror_status_cache.valid_until:
             return _mirror_status_cache
+        if _cache_fetching:
+            return _mirror_status_cache
+        _cache_fetching = True
 
     try:
         request = urllib.request.Request(
@@ -176,11 +181,14 @@ def fetch_mirror_status_from_api() -> MirrorStatusCache | None:
             )
             with _cache_lock:
                 _mirror_status_cache = result
+                _cache_fetching = False
             return result
 
     except Exception as err:
         print(f"Failed to fetch mirror status: {err}")
 
+    with _cache_lock:
+        _cache_fetching = False
     return None
 
 
@@ -648,3 +656,146 @@ def restore_mirrorlist(backup_path: str, target_path: str = MIRRORLIST_PATH) -> 
             restored_from=backup_path,
             message=f"Failed to restore: {err}",
         )
+
+
+# ── Update check ──────────────────────────────────────────────────────────────
+
+def check_updates() -> int:
+    """Return pending update count via checkupdates. -1 if unavailable."""
+    if shutil.which("checkupdates") is None:
+        return -1
+    try:
+        r = subprocess.run(["checkupdates"], capture_output=True, text=True, timeout=45)
+        return len([ln for ln in r.stdout.splitlines() if ln.strip()])
+    except Exception:
+        return -1
+
+
+# ── Arch news ─────────────────────────────────────────────────────────────────
+
+def fetch_arch_news(max_items: int = 5) -> list[dict]:
+    """Fetch Arch Linux RSS news feed. Returns list of {title, link, pubdate}."""
+    try:
+        with urllib.request.urlopen("https://archlinux.org/feeds/news/", timeout=10) as resp:
+            data = resp.read().decode("utf-8")
+        items: list[dict] = []
+        for m in re.finditer(r"<item>(.*?)</item>", data, re.DOTALL):
+            chunk = m.group(1)
+
+            def _tag(name: str, _chunk: str = chunk) -> str:
+                hit = re.search(
+                    rf"<{name}[^>]*>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</{name}>",
+                    _chunk, re.DOTALL,
+                )
+                return hit.group(1).strip() if hit else ""
+
+            items.append({"title": _tag("title"), "link": _tag("link"), "pubdate": _tag("pubDate")})
+        return items[:max_items]
+    except Exception:
+        return []
+
+
+# ── Pacman log ────────────────────────────────────────────────────────────────
+
+_LOG_PATH = "/var/log/pacman.log"
+_LOG_ACTIONS = {"installed", "upgraded", "removed", "downgraded", "reinstalled"}
+_LOG_RE = re.compile(
+    r"^\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[^\]]*)\] \[ALPM\] (\w+) ([^\s]+) \((.+)\)"
+)
+
+
+def parse_pacman_log(path: str = _LOG_PATH, max_entries: int = 800) -> list[dict]:
+    """Parse pacman.log, return newest-first list of action entry dicts."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return []
+    entries: list[dict] = []
+    for line in reversed(lines):
+        m = _LOG_RE.match(line.strip())
+        if not m or m.group(2) not in _LOG_ACTIONS:
+            continue
+        entries.append({
+            "date": m.group(1)[:16].replace("T", " "),
+            "action": m.group(2),
+            "pkg": m.group(3),
+            "version": m.group(4),
+        })
+        if len(entries) >= max_entries:
+            break
+    return entries
+
+
+# ── Orphan packages ───────────────────────────────────────────────────────────
+
+def get_orphan_packages() -> list[str]:
+    """Return list of orphaned packages (no longer needed as deps)."""
+    try:
+        r = subprocess.run(["pacman", "-Qdtq"], capture_output=True, text=True)
+        return [p for p in r.stdout.splitlines() if p.strip()]
+    except Exception:
+        return []
+
+
+def remove_orphans(packages: list[str]) -> tuple[bool, str]:
+    """Remove orphan packages via pkexec pacman -Rns."""
+    if not packages:
+        return False, "No packages selected"
+    try:
+        r = subprocess.run(
+            ["pkexec", "pacman", "-Rns", "--noconfirm"] + packages,
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            err = r.stderr.strip() or r.stdout.strip()
+            if "Authorization canceled" in err or r.returncode == 127:
+                return False, "Canceled"
+            return False, (err.splitlines()[0] if err else "Failed")
+        return True, f"Removed {len(packages)} package(s)"
+    except Exception as e:
+        return False, str(e)
+
+
+# ── pacnew / pacsave ──────────────────────────────────────────────────────────
+
+def find_pacnew_files() -> list[str]:
+    """Return sorted list of .pacnew/.pacsave files under /etc."""
+    try:
+        r = subprocess.run(
+            ["find", "/etc", "-name", "*.pacnew", "-o", "-name", "*.pacsave"],
+            capture_output=True, text=True, timeout=15,
+        )
+        return sorted(f for f in r.stdout.splitlines() if f.strip())
+    except Exception:
+        return []
+
+
+def apply_pacnew(pacnew_path: str) -> tuple[bool, str]:
+    """Replace original config with .pacnew via pkexec cp."""
+    original = re.sub(r"\.(pacnew|pacsave)$", "", pacnew_path)
+    cmd = f"cp {shlex.quote(pacnew_path)} {shlex.quote(original)}"
+    try:
+        r = subprocess.run(["pkexec", "sh", "-c", cmd], capture_output=True, text=True)
+        if r.returncode != 0:
+            err = r.stderr.strip() or r.stdout.strip()
+            if "Authorization canceled" in err or r.returncode == 127:
+                return False, "Canceled"
+            return False, err or "Failed"
+        return True, f"Applied to {original}"
+    except Exception as e:
+        return False, str(e)
+
+
+def delete_pacnew(path: str) -> tuple[bool, str]:
+    """Delete a .pacnew or .pacsave file via pkexec rm."""
+    try:
+        r = subprocess.run(["pkexec", "rm", "-f", path], capture_output=True, text=True)
+        if r.returncode != 0:
+            err = r.stderr.strip() or r.stdout.strip()
+            if "Authorization canceled" in err or r.returncode == 127:
+                return False, "Canceled"
+            return False, err or "Failed"
+        return True, "Deleted"
+    except Exception as e:
+        return False, str(e)

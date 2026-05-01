@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=vsReflector Manager
+Comment=Visual Arch Linux mirror manager
+Exec=/path/to/vsreflector-manager
+Icon=/path/to/vsreflector-manager.png
+Terminal=false
+Categories=System;Settings;GTK;
+StartupNotify=true
