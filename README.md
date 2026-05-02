@@ -5,6 +5,7 @@
 </p>
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![AUR version](https://img.shields.io/aur/version/vsreflector-manager)](https://aur.archlinux.org/packages/vsreflector-manager)
 
 A visual mirror manager for Arch Linux built with GTK4 and libadwaita.
 
@@ -50,6 +51,12 @@ Optional:
 
 ## Installation
 
+### AUR (recommended)
+
+```bash
+yay -S vsreflector-manager
+```
+
 ### Manual
 
 ```bash
@@ -58,16 +65,6 @@ cd vsReflector-Manager
 chmod +x vsreflector-manager
 ./vsreflector-manager
 ```
-
-### Desktop integration
-
-Copy the included desktop entry to your applications folder:
-
-```bash
-cp vsreflector-manager.desktop ~/.local/share/applications/
-```
-
-Edit `Exec=` and `Icon=` paths inside the file to match where you cloned the repo.
 
 ---
 
